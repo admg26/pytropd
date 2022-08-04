@@ -1,17 +1,15 @@
 from pygeode.var import Var
+from pygeode.dataset import Dataset
 import numpy as np
-import pytropd as pyt
+#import pytropd as pyt
+from metrics import TropD_Metric_OLR
+
 from pygeode.axis import NamedAxis
 import pygeode as pyg
 from scipy import interpolate
 
-class MetricVar (Var):
-  ''''''
-
-  def __init__ (self, data, metric=None, need_pres_axis=0, **params):
-    from pygeode.var import Var
-    '''__init__()'''
-    self.metric_property_name = dict(edj=['u', 'Zonal wind'],
+def metrics_dataset(data, metric, **params):
+    metric_property_name = dict(edj=['u', 'Zonal wind'],
                                 olr=['olr','Outgoing longwave radiation'],
                                 pe=['pe','Precipitation minus evaporation'],
                                 psi=['v','Meridional wind'],
@@ -19,43 +17,65 @@ class MetricVar (Var):
                                 stj=['u','Zonal wind'],
                                 tpb=['T','Temperature'],
                                 uas=['uas','Surface wind'],
+                                gwl=['tracer','Tracer'],
                                 )
 
-    self.metric = metric
 
-    self.needs_paxis = self.pressure_axis_needed()
+    p_axis_status = pressure_axis_status(data)
     
     # make sure data is a dataset not a var
     if isinstance(data, pyg.Var): 
-      data =pyg.asdataset(data)
+      data = pyg.asdataset(data)
 
-    data = self.extract_property_name(data, property_name=['lat','Latitude'])
-    data = self.extract_property_name(data, property_name=['pres','Pressure'])
+    data = extract_property_name(data, property_name=['lat','Latitude'], p_axis_status=p_axis_status)
+    data = extract_property_name(data, property_name=['pres','Pressure'], p_axis_status=p_axis_status)
     #if dataset only contains one pyg.Var, assume
     #this is the correct variable for the metric and return it
     #otherwise, find check the name of the variable for the closest match
     # If none found, raise error.
-    var = self.extract_property_name(data, property_name=self.metric_property_name[self.metric])
+    var = extract_property_name(data, property_name=metric_property_name[metric], p_axis_status=p_axis_status)
 
-    self.var = var.squeeze()
-    self.params = params
+
+    #NH hemisphere
+    NH_data = chop_by_hemisphere(var,hem=1)
+    NH_Var = MetricVar(NH_data, p_axis_status, metric=metric, hem=1, **params)
     
-    axes = list(self.var.axes)
+    #SH hemisphere
+    SH_data = chop_by_hemisphere(var,hem=-1)
+    SH_latitudes = SH_data.lat
+    SH_data = SH_data.replace_axes(lat=pyg.Lat(SH_latitudes[:]*-1))
+    SH_Var = MetricVar(SH_data, p_axis_status, metric=metric, hem=-1, **params)
+   
+    return pyg.Dataset([SH_Var, NH_Var])
+
+
+class MetricVar(Var):
+  ''''''
+
+  def __init__ (self, var, p_axis_status, metric=None,hem=1, **params):
+    '''__init__()'''
+    self.p_axis_status = p_axis_status
+    self.metric = metric
+    self.params = params
+    self.hem = hem
+
+    axes = list(var.axes)
     out_order = [type(i) for i in axes]
 
     if var.hasaxis('Lat'):
       self.has_pres_axis = 0
+      var = var.squeeze() 
       
       #move lat axis to the end
       out_order.append(out_order.pop(var.whichaxis('Lat')))
 
-      if var.hasaxis('Pres'):
+      if var.hasaxis('Pres') and (self.p_axis_status==1):
         #move pres axis to the end
         out_order.append(out_order.pop(var.whichaxis('Pres')))
         self.has_pres_axis = 1
 
       else:
-        if self.needs_paxis:
+        if self.p_axis_status==1:
           print(var)
           raise KeyError('<Pres> axis not found in', var)
    
@@ -65,35 +85,45 @@ class MetricVar (Var):
 
     
     #transpose axes in the order (Lat, Pres)
-    self.var = self.var.transpose(*out_order)
-    
+    self.var = var.transpose(*out_order)
     lataxis = self.var.whichaxis('Lat')
     self.lat_values = self.var.axes[lataxis][:]
 
+
     self.riaxes = [lataxis]
-    if self.has_pres_axis:
-      presaxis = self.var.whichaxis('Pres')
-      self.lev = self.var.axes[presaxis][:]
+    if self.p_axis_status==1:
+      presaxis = var.whichaxis('Pres')
+      self.lev = var.axes[presaxis][:]
       self.params['lev'] = self.lev
       self.riaxes.append(presaxis)
-    
-    self.raxes = [a for i, a in enumerate(self.var.axes) if i in self.riaxes]
-    self.oaxes = [a for i, a in enumerate(self.var.axes) if i not in self.riaxes]
 
-    self.metric_axis = NamedAxis(values=np.arange(2),name='Metrics')
-    self.outaxes = self.oaxes.copy()
-    self.outaxes.append(self.metric_axis)
+    
+    self.raxes = [a for i, a in enumerate(var.axes) if i in self.riaxes]
+    self.oaxes = [a for i, a in enumerate(var.axes) if i not in self.riaxes]
+    
+    if not self.oaxes:
+      new_const_axis = NamedAxis(values=np.arange(1),name='value')
+      self.oaxes.append(new_const_axis)
+    #self.metric_axis = NamedAxis(values=np.arange(1),name='Metrics')
+    #self.outaxes = self.oaxes.copy()
+    #self.outaxes.append(self.metric_axis)
 
     # Construct new variable
-    name = metric.upper() + '_metrics'
-    Var.__init__(self, self.outaxes, var.dtype, name=name, atts=var.atts, plotatts=var.plotatts)
+    if self.hem == 1:
+      name = self.metric.upper() + '_NH_latitude'
+    else: 
+      name = self.metric.upper() + '_SH_latitude'
+
+    Var.__init__(self, self.oaxes, var.dtype, name=name, atts=var.atts, plotatts=var.plotatts)
 
     
   def metric_function(self, data):
-    # Compute the relevant metric:ta
-    metricfunction = getattr(pyt, 'TropD_Metric_' + self.metric.upper()) 
-    metric_lats = metricfunction(data, lat=self.lat_values, **self.params)
-    return np.squeeze(np.array(metric_lats))
+    # Compute the relevant metric
+    #metricfunction = getattr(pyt, 'TropD_Metric_' + self.metric.upper()) 
+    #metric_lats = metricfunction(data, lat=self.lat_values, **self.params)
+    metric_lats = TropD_Metric_OLR(data, lat=self.lat_values, hem=self.hem, **self.params)
+    return np.array(metric_lats)
+
 
 
   def getview (self, view, pbar):
@@ -107,13 +137,13 @@ class MetricVar (Var):
       from pygeode.progress import PBar
       pbar = PBar()
 
-    outview = View(self.outaxes)
+    outview = View(self.oaxes)
 
     #Metric axis is the last in the view
     #Remove from the view for loopover
     loopover_view = view.remove(len(view.shape)-1)
     # Construct work arrays
-    x = np.zeros(loopover_view.shape + (2,), 'd')
+    x = np.zeros(loopover_view.shape + (1,), 'd')
 
     x[()] = np.nan
 
@@ -122,7 +152,6 @@ class MetricVar (Var):
       signature = '(i,j)->(k)'
     else:
       signature = '(i)->(k)'
-
     metric_function_v = np.vectorize(self.metric_function, signature=signature)
   
     
@@ -132,121 +161,134 @@ class MetricVar (Var):
       xdata = xdata.astype('d')
       x[outsl] = metric_function_v(xdata)
 
-    maxis = self.whichaxis(self.metric_axis)
-    metric_values_requested = view.subaxis(maxis)[:]
-    return x[...,metric_values_requested]
+    return x
 
-  def pressure_axis_needed(self):
-    # metrics that take 1D variable as input
-    if self.metric in ['edj','olr','pe','psl','uas']:
-      return 0
+def pressure_axis_status(metric):
+  # metrics that take 1D variable as input
+  if metric in ['edj','olr','pe','psl','uas']:
+    return 0
 
-    #metrics that take 2D variable as input
-    elif self.metric in ['psi','stj','tpb']:
-      return 1
+  #metrics that take 2D variable as input
+  elif metric in ['psi','stj','tpb']:
+    return 1
   
-  def extract_property_name(self, data, property_name): 
-  
-    find_index = 0
-  
-    if property_name[0] == 'lat':
-      #check if pyg.Lat axis is present, else look for a match
-      if data.hasaxis(pyg.Lat):
-        print('Found Latitude axis in the dataset')
-        return data
-  
-      else:
-        dataset_keys = list(data.axisdict.keys())
-        property_name_list = ['lat','latitude','lats','x','phi','degreesnorth']
-        find_index = 1
-  
-    elif property_name[0] == 'pres':  
-      #check if pyg.Pres axis is present, else look for a match
-      if data.hasaxis(pyg.Pres):
-        print('Found Pressure axis in the dataset')
-        return data
-  
-      else:
-        #try to see if there is a pressure axis as a pyg.NamedAxis
-        dataset_keys = list(data.axisdict.keys())
-        property_name_list = ['pres','pressure','p','lev','levels','level']
-        find_index = 1
-  
+  #metrics that can 2D variable as input but do not collapse pressure axis
+  elif metric in ['gwl', 'onesigma']:
+    return 2
+
+def extract_property_name(data, property_name, p_axis_status): 
+
+  find_index = 0
+
+  if property_name[0] == 'lat':
+    #check if pyg.Lat axis is present, else look for a match
+    if data.hasaxis(pyg.Lat):
+      print('Found Latitude axis in the dataset')
+      return data
+
     else:
-      dataset_keys = list(data.vardict.keys())
-  
-      #if we are only given one data array in the dataset, assume it is the right one,
-      if len(dataset_keys) == 1:
-        index = [0]
-  
-      #otherwise look for a matching variable name 
-      else:
-        if property_name[0] == 'u':
-          property_name_list = ['zonalwind','uwind','u','xwind']
-          if property_name[0] == 'uas':
-            property_name_list = ['surfacewind','uas','us','surfu','usurf']
-          elif property_name[0] == 'v':
-            property_name_list = ['meridionalwind','vwind','v','ywind']
-          elif property_name[0] == 'T':
-            property_name_list = ['t','temp','temperature']
-          elif property_name[0] == 'psl':
-            property_name_list = ['sealevelpressure','slp','psl','ps','sp']
-          elif property_name[0] == 'olr':
-            property_name_list = ['olr','outgoinglongwaveradiation','toaolr','olrtoa']
-          elif property_name[0] == 'pe':
-            property_name_list = ['pe','precipitationminusevarporation','pminuse']
-          find_index = 1
-  
-    if find_index:
-      #array names in dataset. Remove whitespace, underscores and make lowercase
-      array_names = [string.strip().lower().replace('_','').replace('-','') for string in dataset_keys]
-      #create dict of indices in dataset
-      indices_dict = dict((k,i) for i,k in enumerate(array_names)) 
-      #find variable
-      intersection = set(indices_dict).intersection(property_name_list)  
-      #extract relevant index
-      index = [indices_dict[x] for x in intersection]
-  
-    if property_name[0] == 'pres':
-      #Return an error if we need a pressure axis
-      if self.needs_paxis and len(index)==0: 
-        print(data)
-        raise KeyError('%s not found in Dataset. Valid variable names are %s'%(property_name[1],property_name_list))
-  
-      elif len(index)==1:
-        #if we find a pres axis convert it to a pyg.Pres axis and return data
-        print('Using %s in the dataset as the %s'%(dataset_keys[index[0]],property_name[1]))
-        pres_axis = getattr(data, dataset_keys[index[0]])
-        print('Replacing pyg.NamedAxis %s with a pyg.Pres axis in the dataset'%(dataset_keys[index[0]]))
-        return data.replace_axes({dataset_keys[index[0]]: pyg.Pres(pres_axis[:])})
+      dataset_keys = list(data.axisdict.keys())
+      property_name_list = ['lat','latitude','lats','x','phi','degreesnorth']
+      find_index = 1
 
-      else:
-        return data
-  
-    if len(index)==0: 
+  elif property_name[0] == 'pres':  
+    #check if pyg.Pres axis is present, else look for a match
+    if data.hasaxis(pyg.Pres):
+      print('Found Pressure axis in the dataset')
+      return data
+
+    else:
+      #try to see if there is a pressure axis as a pyg.NamedAxis
+      dataset_keys = list(data.axisdict.keys())
+      property_name_list = ['pres','pressure','p','lev','levels','level']
+      find_index = 1
+
+  else:
+    dataset_keys = list(data.vardict.keys())
+
+    #if we are only given one data array in the dataset, assume it is the right one,
+    if len(dataset_keys) == 1:
+      index = [0]
+
+    #otherwise look for a matching variable name 
+    else:
+      if property_name[0] == 'u':
+        property_name_list = ['zonalwind','uwind','u','xwind']
+        if property_name[0] == 'uas':
+          property_name_list = ['surfacewind','uas','us','surfu','usurf']
+        elif property_name[0] == 'v':
+          property_name_list = ['meridionalwind','vwind','v','ywind']
+        elif property_name[0] == 'T':
+          property_name_list = ['t','temp','temperature']
+        elif property_name[0] == 'psl':
+          property_name_list = ['sealevelpressure','slp','psl','ps','sp']
+        elif property_name[0] == 'olr':
+          property_name_list = ['olr','outgoinglongwaveradiation','toaolr','olrtoa']
+        elif property_name[0] == 'pe':
+          property_name_list = ['pe','precipitationminusevarporation','pminuse']
+        find_index = 1
+
+  if find_index:
+    #array names in dataset. Remove whitespace, underscores and make lowercase
+    array_names = [string.strip().lower().replace('_','').replace('-','') for string in dataset_keys]
+    #create dict of indices in dataset
+    indices_dict = dict((k,i) for i,k in enumerate(array_names)) 
+    #find variable
+    intersection = set(indices_dict).intersection(property_name_list)  
+    #extract relevant index
+    index = [indices_dict[x] for x in intersection]
+
+  if property_name[0] == 'pres':
+    #Return an error if we need a pressure axis
+    if p_axis_status and len(index)==0: 
       print(data)
       raise KeyError('%s not found in Dataset. Valid variable names are %s'%(property_name[1],property_name_list))
-  
-  
-    if len(index)>1:
-      print(data)
-      print('More than one possible key for %s found. Valid variable names are %s'%(property_name[1],property_name_list))
-      raise KeyError
-  
-    if property_name[0] == 'lat' and find_index:
+
+    elif len(index)==1:
+      #if we find a pres axis convert it to a pyg.Pres axis and return data
       print('Using %s in the dataset as the %s'%(dataset_keys[index[0]],property_name[1]))
-      lat_axis = getattr(data, dataset_keys[index[0]])
-      print('Replacing pyg.NamedAxis %s with a pyg.Lat axis in the dataset'%(dataset_keys[index[0]]))
-      return data.replace_axes({dataset_keys[index[0]]: pyg.Lat(lat_axis[:])})
-  
-  
+      pres_axis = getattr(data, dataset_keys[index[0]])
+      print('Replacing pyg.NamedAxis %s with a pyg.Pres axis in the dataset'%(dataset_keys[index[0]]))
+      return data.replace_axes({dataset_keys[index[0]]: pyg.Pres(pres_axis[:])})
+
     else:
-      print('Using %s in the dataset as the %s'%(dataset_keys[index[0]],property_name[1]))
-      return getattr(data, dataset_keys[index[0]])
-  
-  
+      return data
+
+  if len(index)==0: 
+    print(data)
+    raise KeyError('%s not found in Dataset. Valid variable names are %s'%(property_name[1],property_name_list))
 
 
+  if len(index)>1:
+    print(data)
+    print('More than one possible key for %s found. Valid variable names are %s'%(property_name[1],property_name_list))
+    raise KeyError
+
+  if property_name[0] == 'lat' and find_index:
+    print('Using %s in the dataset as the %s'%(dataset_keys[index[0]],property_name[1]))
+    lat_axis = getattr(data, dataset_keys[index[0]])
+    print('Replacing pyg.NamedAxis %s with a pyg.Lat axis in the dataset'%(dataset_keys[index[0]]))
+    return data.replace_axes({dataset_keys[index[0]]: pyg.Lat(lat_axis[:])})
+
+
+  else:
+    print('Using %s in the dataset as the %s'%(dataset_keys[index[0]],property_name[1]))
+    return getattr(data, dataset_keys[index[0]])
+  
+  
+def chop_by_hemisphere(data, hem=1):
+  if data.hasaxis('Lat'):
+    minlat = data.lat.min() 
+    maxlat = data.lat.max() 
+    if (hem == 1 and maxlat > 0):
+      return data(lat=(0,90)).sorted(lat=1)
+    elif (hem == -1 and minlat < 0):
+      return data(lat=(-90,0)).sorted(lat=-1)
+    else:
+      return None
+
+  else:
+    raise KeyError('Latitude axis not found')
 
 def pyg_edj(data,**params):
 
@@ -293,12 +335,13 @@ def pyg_edj(data,**params):
   >>> print(edj(U)[:])
   [-45.  45.]
   '''
+
   EDJ_Var = MetricVar(data, metric='edj', **params)
 
   return EDJ_Var
 
 
-def pyg_olr(var, **params):
+def pyg_olr(data, **params):
 
   """TropD Outgoing Longwave Radiation (OLR) metric
      
@@ -357,9 +400,10 @@ def pyg_olr(var, **params):
   """
 
 
-  OLR_Var = MetricVar(var, metric='olr', **params)
+  #OLR_Var = MetricVar(var, metric='olr', **params)
+  OLR_Dataset = metrics_dataset(data, metric='olr', **params)
 
-  return OLR_Var
+  return OLR_Dataset
 
 def pyg_pe(var, **params):
 
@@ -641,4 +685,21 @@ def pyg_uas(var,**params):
 
   return UAS_Var
 
+def pyg_gwl(var, **params):
+
+  '''     
+  '''     
+
+  GWL_Var = MetricVar(var, metric='gwl', **params)
+
+  return GWL_Var
+
+def pyg_onesigma(var, **params):
+
+  '''     
+  '''     
+
+  OneSigma_Var = MetricVar(var, metric='onesigma', **params)
+
+  return OneSigma_Var
 
